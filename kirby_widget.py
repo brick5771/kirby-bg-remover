@@ -1,4 +1,4 @@
-"""Frameless transparent floating Kirby desktop mascot with 60fps animations."""
+"""Frameless transparent floating Kirby desktop mascot with 60fps single & batch animations."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from PIL import Image, ImageOps
 from PySide6.QtCore import (
@@ -24,7 +24,6 @@ from PySide6.QtGui import (
     QAction,
     QBrush,
     QColor,
-    QConicalGradient,
     QDragEnterEvent,
     QDragLeaveEvent,
     QDragMoveEvent,
@@ -53,11 +52,11 @@ from PySide6.QtWidgets import (
 from bg_worker import (
     MODEL_OPTIONS,
     MODEL_ORDER,
-    RemoveBgThread,
+    BatchProcessThread,
     SessionCache,
     start_prewarm_daemon,
 )
-from clipboard_win import IMAGE_EXTENSIONS, pil_to_qimage, qimage_to_pil, read_image_from_clipboard
+from clipboard_win import IMAGE_EXTENSIONS, pil_to_qimage, qimage_to_pil, read_images_from_clipboard
 from result_card import ResultCardWindow
 from sound_fx import SoundManager
 
@@ -90,13 +89,13 @@ class SparkleParticle:
     lifetime: float = 0.8
     rotation: float = 0.0
     vrot: float = 180.0
-    kind: str = "star"  # "star" | "dot"
+    kind: str = "star"
 
 
 @dataclass
 class WindStreak:
-    angle: float       # radians around mouth (biased toward right/front)
-    radius: float      # current distance from mouth center
+    angle: float
+    radius: float
     max_radius: float
     speed: float
     length: float
@@ -118,7 +117,9 @@ def _ease_out_cubic(t: float) -> float:
     return 1.0 - (1.0 - t) ** 3
 
 
-def _draw_four_point_star(p: QPainter, cx: float, cy: float, r: float, rot_deg: float, color: QColor) -> None:
+def _draw_four_point_star(
+    p: QPainter, cx: float, cy: float, r: float, rot_deg: float, color: QColor
+) -> None:
     p.save()
     p.translate(cx, cy)
     p.rotate(rot_deg)
@@ -141,7 +142,7 @@ def _draw_four_point_star(p: QPainter, cx: float, cy: float, r: float, rot_deg: 
 
 
 class KirbyMascotWindow(QWidget):
-    """Transparent floating Kirby desktop pet & AI background remover."""
+    """Transparent floating Kirby desktop pet & AI background remover / B&W converter."""
 
     quit_requested = Signal()
 
@@ -161,7 +162,7 @@ class KirbyMascotWindow(QWidget):
         # Core services
         self._sound = SoundManager(assets_dir / "sfx", parent=self)
         self._cache = SessionCache()
-        self._model_key = "fast"  # Default fastest mode when floating on desktop
+        self._model_key = "fast"
         self._always_on_top = True
         desktop_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
         self._last_open_dir = desktop_dir or str(Path.home() / "Desktop")
@@ -173,13 +174,13 @@ class KirbyMascotWindow(QWidget):
         self._last_tick = time.perf_counter()
         self._status_text = ""
 
-        # Current job data
-        self._current_source_pil: Optional[Image.Image] = None
-        self._current_source_stem: str = "kirby_cutout"
-        self._inhale_pixmap: Optional[QPixmap] = None
-        self._popout_pixmap: Optional[QPixmap] = None
-        self._pending_result: Optional[tuple[Image.Image, float, str, str]] = None
-        self._worker: Optional[RemoveBgThread] = None
+        # Current batch job data
+        self._current_source_items: List[Tuple[Image.Image, str]] = []
+        self._inhale_pixmaps: List[QPixmap] = []
+        self._popout_pixmaps: List[QPixmap] = []
+        self._batch_count = 1
+        self._pending_result: Optional[Tuple[List[Tuple[Image.Image, str]], float, str]] = None
+        self._worker: Optional[BatchProcessThread] = None
         self._inhale_duration = 0.96
         self._min_digest_duration = 0.42
         self._popout_duration = 0.88
@@ -202,8 +203,8 @@ class KirbyMascotWindow(QWidget):
         self._result_card = ResultCardWindow(self._sound)
         self._result_card.setWindowIcon(self._icon)
         self._result_card.model_selected.connect(self._on_model_selected)
-        self._result_card.file_dropped.connect(self.eat_file)
-        self._result_card.image_pasted.connect(self.eat_pil_image)
+        self._result_card.files_dropped.connect(self.eat_files)
+        self._result_card.images_pasted.connect(self.eat_pil_images)
         self._result_card.pick_new_requested.connect(self.open_file_picker)
 
         # Window setup: frameless, transparent, stays on top
@@ -223,17 +224,14 @@ class KirbyMascotWindow(QWidget):
         self._setup_tray()
         self._position_initial()
 
-        # Fade-hide timer for hover controls
         self._toolbar_hide_timer = QTimer(self)
         self._toolbar_hide_timer.setSingleShot(True)
         self._toolbar_hide_timer.timeout.connect(self._maybe_hide_toolbar)
 
-        # 60fps animation loop
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._tick)
         self._anim_timer.start(16)
 
-        # Prewarm fastest model on a safe daemon thread right after UI appears
         self._prewarm = start_prewarm_daemon(self._cache, "fast")
 
     def _position_initial(self) -> None:
@@ -241,13 +239,11 @@ class KirbyMascotWindow(QWidget):
         if not screen:
             return
         avail = screen.availableGeometry()
-        # Place Kirby comfortably at lower-right quadrant of desktop
         x = avail.right() - CANVAS_W - 28
         y = avail.bottom() - CANVAS_H - 36
         self.move(x, y)
 
     def _build_hover_toolbar(self) -> None:
-        """Compact floating pill bar at Kirby's top-right (visible on hover)."""
         self._toolbar = QWidget(self)
         self._toolbar.setObjectName("HoverBar")
         row = QHBoxLayout(self._toolbar)
@@ -323,13 +319,15 @@ class KirbyMascotWindow(QWidget):
             }
             """
         )
-        self._toolbar.adjustSize()
         self._place_toolbar()
         self._toolbar.setVisible(False)
 
     def _place_toolbar(self) -> None:
         self._toolbar.adjustSize()
-        tx = min(CANVAS_W - self._toolbar.width() - 8, KIRBY_X + KIRBY_SIZE - self._toolbar.width() + 42)
+        tx = min(
+            CANVAS_W - self._toolbar.width() - 8,
+            KIRBY_X + KIRBY_SIZE - self._toolbar.width() + 42,
+        )
         ty = max(6, KIRBY_Y - 40)
         self._toolbar.move(tx, ty)
 
@@ -338,18 +336,18 @@ class KirbyMascotWindow(QWidget):
 
     def _setup_tray(self) -> None:
         self._tray = QSystemTrayIcon(self._icon, self)
-        self._tray.setToolTip("星之卡比去背精靈（拖曳圖片進嘴巴即可去背）")
+        self._tray.setToolTip("星之卡比去背精靈（拖曳單張或多張圖片進嘴巴）")
 
         menu = QMenu()
         act_show = QAction("🌸 顯示星之卡比", menu)
         act_show.triggered.connect(self.bring_to_front)
         menu.addAction(act_show)
 
-        act_pick = QAction("🍓 選擇圖片去背...", menu)
+        act_pick = QAction("🍓 選擇一張或多張圖片...", menu)
         act_pick.triggered.connect(self.open_file_picker)
         menu.addAction(act_pick)
 
-        act_paste = QAction("📋 貼上剪貼簿圖片 (Ctrl+V)", menu)
+        act_paste = QAction("📋 貼上剪貼簿圖片 (Ctrl+V・支援多張)", menu)
         act_paste.triggered.connect(self.paste_from_clipboard)
         menu.addAction(act_paste)
 
@@ -401,7 +399,7 @@ class KirbyMascotWindow(QWidget):
             KIRBY_Y + KIRBY_SIZE * MOUTH_NORM_CY,
         )
 
-    def _mouth_radii(self) -> tuple[float, float]:
+    def _mouth_radii(self) -> Tuple[float, float]:
         return (KIRBY_SIZE * MOUTH_NORM_RX, KIRBY_SIZE * MOUTH_NORM_RY)
 
     def _back_exit_point(self) -> QPointF:
@@ -421,7 +419,6 @@ class KirbyMascotWindow(QWidget):
         r = self._kirby_rect()
         if not r.contains(pt):
             return False
-        # Check cached alpha on Kirby sprite for fast silhouette hit-test
         nx = (pt.x() - r.x()) / r.width()
         ny = (pt.y() - r.y()) / r.height()
         img = self._kirby_qimage
@@ -457,9 +454,10 @@ class KirbyMascotWindow(QWidget):
             QColor("#FFFFFF"),
             QColor("#C69BFF"),
         ]
-        for _ in range(18):
+        count = 24 if self._batch_count > 1 else 18
+        for _ in range(count):
             ang = math.radians(random.uniform(118, 252))
-            spd = random.uniform(75.0, 215.0)
+            spd = random.uniform(75.0, 225.0)
             self._particles.append(
                 SparkleParticle(
                     x=origin.x() + random.uniform(-10, 10),
@@ -497,71 +495,85 @@ class KirbyMascotWindow(QWidget):
             )
         )
 
-    # --- Public actions ---
+    # --- Public actions (Single & Multi-Image Batch) ---
     def open_file_picker(self) -> None:
         if self._state in (self.STATE_INHALING, self.STATE_DIGESTING):
             return
         self._sound.play("click")
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "選擇要餵給星之卡比去背的圖片",
+            "選擇要餵給星之卡比的圖片（可複選多張）",
             self._last_open_dir,
             "圖片檔案 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff);;所有檔案 (*.*)",
         )
-        if path:
-            self._last_open_dir = str(Path(path).parent)
-            self.eat_file(path)
+        if paths:
+            self._last_open_dir = str(Path(paths[0]).parent)
+            self.eat_files(paths)
 
     def paste_from_clipboard(self) -> None:
         if self._state in (self.STATE_INHALING, self.STATE_DIGESTING):
             return
-        res = read_image_from_clipboard()
-        if res is None:
+        items = read_images_from_clipboard()
+        if not items:
             self._show_temp_status("剪貼簿裡沒有圖片喔！")
             return
-        img, stem = res
-        self.eat_pil_image(img, stem)
+        self.eat_pil_images(items)
 
     def eat_file(self, path_str: str) -> None:
-        p = Path(path_str)
-        if not p.is_file():
+        self.eat_files([path_str])
+
+    def eat_files(self, path_list: List[str]) -> None:
+        loaded: List[Tuple[Image.Image, str]] = []
+        last_parent: Optional[Path] = None
+        for path_str in path_list:
+            p = Path(path_str)
+            if not p.is_file():
+                continue
+            try:
+                img = ImageOps.exif_transpose(Image.open(p)).convert("RGBA")
+                loaded.append((img, p.stem))
+                last_parent = p.parent
+            except Exception:
+                pass
+        if not loaded:
+            self._show_temp_status("無法讀取圖片檔案")
             return
-        try:
-            img = Image.open(p)
-            img = ImageOps.exif_transpose(img).convert("RGBA")
-        except Exception as exc:
-            self._show_temp_status(f"無法讀取圖片：{exc}")
-            return
-        self._last_open_dir = str(p.parent)
-        self.eat_pil_image(img, p.stem)
+        if last_parent is not None:
+            self._last_open_dir = str(last_parent)
+        self.eat_pil_images(loaded)
 
     def eat_pil_image(self, pil_img: Image.Image, source_stem: str = "kirby_cutout") -> None:
-        # Cancel/ignore if already eating
+        self.eat_pil_images([(pil_img, source_stem)])
+
+    def eat_pil_images(self, items: List[Tuple[Image.Image, str]]) -> None:
+        if not items:
+            return
         if self._worker is not None and self._worker.isRunning():
             return
 
-        self._current_source_pil = pil_img.copy()
-        self._current_source_stem = source_stem or "kirby_cutout"
+        self._current_source_items = [(img.copy(), stem or f"kirby_{i}") for i, (img, stem) in enumerate(items, 1)]
+        self._batch_count = len(self._current_source_items)
         self._pending_result = None
 
-        # Create crisp thumbnail for the spiraling inhale animation
-        thumb = pil_img.copy()
-        thumb.thumbnail((112, 112), Image.Resampling.LANCZOS)
-        self._inhale_pixmap = QPixmap.fromImage(pil_to_qimage(thumb))
+        # Build up to 5 staggered thumbnails for the swirling multi-image inhale stream
+        self._inhale_pixmaps = []
+        for img, _ in self._current_source_items[:5]:
+            thumb = img.copy()
+            thumb.thumbnail((108 if self._batch_count == 1 else 86, 108 if self._batch_count == 1 else 86), Image.Resampling.LANCZOS)
+            self._inhale_pixmaps.append(QPixmap.fromImage(pil_to_qimage(thumb)))
 
-        # Hide previous result card while Kirby eats the new image
+        self._inhale_duration = 0.96 if self._batch_count == 1 else min(1.38, 0.96 + 0.11 * min(4, self._batch_count - 1))
         self._result_card.hide()
 
-        # Enter INHALING animation AND start rembg worker immediately in parallel!
         self._state = self.STATE_INHALING
         self._state_t = 0.0
-        self._status_text = ""
+        self._status_text = f"吸入 {self._batch_count} 張圖片中..." if self._batch_count > 1 else ""
         self._sound.play("inhale")
-        self._start_worker(self._current_source_pil, self._model_key, self._current_source_stem)
+        self._start_worker(self._current_source_items, self._model_key)
         self.update()
 
     def _rerun_current_with_model(self, model_key: str) -> None:
-        if self._current_source_pil is None:
+        if not self._current_source_items:
             return
         if self._worker is not None and self._worker.isRunning():
             return
@@ -571,11 +583,11 @@ class KirbyMascotWindow(QWidget):
         self._state_t = 0.0
         self._status_text = f"切換 {MODEL_OPTIONS[model_key].short_label} 重新處理中..."
         self._sound.play("gulp")
-        self._start_worker(self._current_source_pil, model_key, self._current_source_stem)
+        self._start_worker(self._current_source_items, model_key)
         self.update()
 
-    def _start_worker(self, pil_img: Image.Image, model_key: str, stem: str) -> None:
-        worker = RemoveBgThread(self._cache, pil_img, model_key, stem, parent=self)
+    def _start_worker(self, items: List[Tuple[Image.Image, str]], model_key: str) -> None:
+        worker = BatchProcessThread(self._cache, items, model_key, parent=self)
         worker.status_changed.connect(self._on_worker_status)
         worker.finished_ok.connect(self._on_worker_ok)
         worker.finished_err.connect(self._on_worker_err)
@@ -586,11 +598,16 @@ class KirbyMascotWindow(QWidget):
     def _on_worker_status(self, msg: str) -> None:
         self._status_text = msg
 
-    def _on_worker_ok(self, result_pil: Image.Image, elapsed_s: float, model_key: str, stem: str) -> None:
-        self._pending_result = (result_pil, elapsed_s, model_key, stem)
-        thumb = result_pil.copy()
-        thumb.thumbnail((132, 132), Image.Resampling.LANCZOS)
-        self._popout_pixmap = QPixmap.fromImage(pil_to_qimage(thumb))
+    def _on_worker_ok(
+        self, result_items: List[Tuple[Image.Image, str]], elapsed_s: float, model_key: str
+    ) -> None:
+        self._pending_result = (result_items, elapsed_s, model_key)
+        self._popout_pixmaps = []
+        max_sz = 130 if len(result_items) == 1 else 96
+        for img, _ in result_items[:5]:
+            thumb = img.copy()
+            thumb.thumbnail((max_sz, max_sz), Image.Resampling.LANCZOS)
+            self._popout_pixmaps.append(QPixmap.fromImage(pil_to_qimage(thumb)))
 
     def _on_worker_err(self, err_msg: str) -> None:
         self._state = self.STATE_IDLE
@@ -619,7 +636,7 @@ class KirbyMascotWindow(QWidget):
         self._model_btn.setText(f"{opt.short_label} ▾")
         self._result_card.set_model_key(model_key)
         self._place_toolbar()
-        if rerun_current and self._current_source_pil is not None:
+        if rerun_current and self._current_source_items:
             self._rerun_current_with_model(model_key)
 
     def _open_model_menu(self) -> None:
@@ -708,11 +725,11 @@ class KirbyMascotWindow(QWidget):
             """
         )
 
-        act_pick = QAction("🍓 選擇圖片餵給卡比...", menu)
+        act_pick = QAction("🍓 選擇一張或多張圖片餵給卡比...", menu)
         act_pick.triggered.connect(self.open_file_picker)
         menu.addAction(act_pick)
 
-        act_paste = QAction("📋 貼上剪貼簿圖片 (Ctrl+V)", menu)
+        act_paste = QAction("📋 貼上剪貼簿圖片 (Ctrl+V・支援多張)", menu)
         act_paste.triggered.connect(self.paste_from_clipboard)
         menu.addAction(act_paste)
 
@@ -778,7 +795,6 @@ class KirbyMascotWindow(QWidget):
         self._clock_t += dt
         self._state_t += dt
 
-        # Update wind streaks during drag-hover and inhaling
         if self._state in (self.STATE_DRAG_HOVER, self.STATE_INHALING):
             speed_mult = 1.65 if self._state == self.STATE_INHALING else 1.0
             for ws in self._wind_streaks:
@@ -789,7 +805,6 @@ class KirbyMascotWindow(QWidget):
             if self._state == self.STATE_INHALING and random.random() < 0.35:
                 self._spawn_inhale_sparkle()
 
-        # Update sparkles
         alive: List[SparkleParticle] = []
         for sp in self._particles:
             sp.age += dt
@@ -802,7 +817,6 @@ class KirbyMascotWindow(QWidget):
                 alive.append(sp)
         self._particles = alive
 
-        # State transitions
         if self._state == self.STATE_INHALING:
             if self._state_t >= self._inhale_duration:
                 self._state = self.STATE_DIGESTING
@@ -820,14 +834,14 @@ class KirbyMascotWindow(QWidget):
                 self._state = self.STATE_IDLE
                 self._state_t = 0.0
                 if self._pending_result is not None:
-                    res_img, elapsed_s, model_key, stem = self._pending_result
+                    res_items, elapsed_s, model_key = self._pending_result
                     self._pending_result = None
                     kirby_global_rect = QRect(
                         self.mapToGlobal(QPoint(KIRBY_X, KIRBY_Y)),
                         self._kirby_rect().toRect().size(),
                     )
-                    self._result_card.show_result(
-                        res_img, elapsed_s, model_key, stem, kirby_global_rect
+                    self._result_card.show_results(
+                        res_items, elapsed_s, model_key, kirby_global_rect
                     )
 
         self.update()
@@ -842,7 +856,6 @@ class KirbyMascotWindow(QWidget):
         kr = self._kirby_rect()
         kc = kr.center()
 
-        # Compute Kirby squash/stretch/float transform for current state
         bob_y = 0.0
         sx = 1.0
         sy = 1.0
@@ -881,7 +894,6 @@ class KirbyMascotWindow(QWidget):
             bob_y = -abs(math.sin(self._state_t * 6.8)) * 6.5
         elif self._state == self.STATE_POPPING_OUT:
             prog = min(1.0, self._state_t / self._popout_duration)
-            # Elastic recoil pop!
             recoil = math.exp(-prog * 6.5) * math.cos(prog * 15.0)
             sx = 1.0 + 0.13 * recoil
             sy = 1.0 - 0.11 * recoil
@@ -901,17 +913,19 @@ class KirbyMascotWindow(QWidget):
         p.drawEllipse(QPointF(shadow_cx, shadow_cy), shadow_w * 0.5, shadow_h * 0.5)
         p.restore()
 
-        # 1) During DRAG_HOVER, paint subtle translucent suction aura around mouth
-        #    so the front drop zone stays softly interactive & visually inviting
         if self._state == self.STATE_DRAG_HOVER:
             self._paint_suction_aura(p, mc)
 
-        # 2) POPPING_OUT Phase A (t < 0.48): draw cutout BEHIND Kirby's back!
-        pop_prog = min(1.0, self._state_t / self._popout_duration) if self._state == self.STATE_POPPING_OUT else 0.0
+        # 2) POPPING_OUT Phase A (t < 0.48): draw cutouts BEHIND Kirby's back!
+        pop_prog = (
+            min(1.0, self._state_t / self._popout_duration)
+            if self._state == self.STATE_POPPING_OUT
+            else 0.0
+        )
         if self._state == self.STATE_POPPING_OUT and pop_prog < 0.48:
-            self._paint_popout_cutout(p, pop_prog)
+            self._paint_popout_cutouts(p, pop_prog)
 
-        # 3) Draw Kirby sprite with elastic squash/stretch & float
+        # 3) Draw Kirby sprite
         p.save()
         p.translate(kc.x() + jitter_x, kc.y() + bob_y + jitter_y)
         p.rotate(rot_deg)
@@ -920,28 +934,28 @@ class KirbyMascotWindow(QWidget):
         p.drawPixmap(target, self._kirby_pixmap, QRectF(self._kirby_pixmap.rect()))
         p.restore()
 
-        # 4) Suction wind lines & swirling incoming image into Kirby's mouth
+        # 4) Suction wind lines & swirling incoming image(s)
         if self._state in (self.STATE_DRAG_HOVER, self.STATE_INHALING):
             self._paint_wind_streaks(p, QPointF(mc.x() + jitter_x, mc.y() + bob_y + jitter_y))
 
-        if self._state == self.STATE_INHALING and self._inhale_pixmap is not None:
-            self._paint_inhaling_image(p, QPointF(mc.x() + jitter_x, mc.y() + bob_y + jitter_y))
+        if self._state == self.STATE_INHALING and self._inhale_pixmaps:
+            self._paint_inhaling_images(p, QPointF(mc.x() + jitter_x, mc.y() + bob_y + jitter_y))
 
-        # 5) POPPING_OUT Phase B (t >= 0.48): cutout leaps clear in front of Kirby's back!
+        # 5) POPPING_OUT Phase B (t >= 0.48): cutouts emerge cleanly in front of back!
         if self._state == self.STATE_POPPING_OUT and pop_prog >= 0.48:
-            self._paint_popout_cutout(p, pop_prog)
+            self._paint_popout_cutouts(p, pop_prog)
 
-        # 6) Orbiting stars while digesting
         if self._state == self.STATE_DIGESTING:
             self._paint_digest_orbit(p, QPointF(kc.x(), kc.y() + bob_y))
 
-        # 7) Sparkle burst particles
         for sp in self._particles:
             alpha = int(255 * max(0.0, 1.0 - (sp.age / sp.lifetime) ** 1.4))
             c = QColor(sp.color)
             c.setAlpha(alpha)
             if sp.kind == "star":
-                _draw_four_point_star(p, sp.x, sp.y, sp.size * (1.0 - 0.35 * sp.age / sp.lifetime), sp.rotation, c)
+                _draw_four_point_star(
+                    p, sp.x, sp.y, sp.size * (1.0 - 0.35 * sp.age / sp.lifetime), sp.rotation, c
+                )
             else:
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(c)
@@ -964,7 +978,7 @@ class KirbyMascotWindow(QWidget):
         elif self._status_text:
             pill_text = self._status_text
         elif self._state == self.STATE_IDLE and self._hovering:
-            pill_text = "拖圖進嘴巴・點嘴巴選圖・Ctrl+V"
+            pill_text = "拖圖進嘴巴・點嘴巴選圖・Ctrl+V（支援多張）"
 
         if pill_text:
             self._paint_bottom_pill(p, kc.x(), kr.bottom() + 26.0, pill_text)
@@ -981,7 +995,6 @@ class KirbyMascotWindow(QWidget):
         p.setBrush(QBrush(grad))
         p.drawEllipse(QPointF(mc.x() + 22, mc.y() + 6), aura_r, aura_r * 0.88)
 
-        # Dashed cute target ring around mouth
         rx, ry = self._mouth_radii()
         pen = QPen(QColor(255, 240, 248, 200), 2.5, Qt.PenStyle.DashLine)
         pen.setDashOffset(-self._clock_t * 14.0)
@@ -996,7 +1009,6 @@ class KirbyMascotWindow(QWidget):
         for ws in self._wind_streaks:
             r_in = max(8.0, ws.radius - ws.length)
             r_out = ws.radius
-            # Slight swirl curve as wind enters mouth
             swirl_in = ws.angle + 0.16 * (1.0 - r_in / ws.max_radius)
             swirl_mid = ws.angle + 0.08 * (1.0 - (r_in + r_out) * 0.5 / ws.max_radius)
             p0 = QPointF(mc.x() + math.cos(ws.angle) * r_out, mc.y() + math.sin(ws.angle) * r_out)
@@ -1015,38 +1027,45 @@ class KirbyMascotWindow(QWidget):
             p.drawPath(path)
         p.restore()
 
-    def _paint_inhaling_image(self, p: QPainter, mc: QPointF) -> None:
-        """Rotates and shrinks the user's image along a vortex spiral straight into Kirby's mouth."""
-        prog = min(1.0, self._state_t / self._inhale_duration)
-        pm = self._inhale_pixmap
-        if pm is None:
+    def _paint_inhaling_images(self, p: QPainter, mc: QPointF) -> None:
+        """Rotates and shrinks one or a staggered stream of images into Kirby's mouth."""
+        total_prog = min(1.0, self._state_t / self._inhale_duration)
+        n = len(self._inhale_pixmaps)
+        if n == 0:
             return
 
-        p.save()
+        # Draw back-to-front so lead image is cleanly layered
+        span = 0.28 if n > 1 else 0.0
+        item_dur = max(0.55, 1.0 - span)
+        for idx in range(n - 1, -1, -1):
+            start_at = (idx / max(1, n - 1)) * span if n > 1 else 0.0
+            local_t = (total_prog - start_at) / item_dur
+            if local_t <= 0.0 or local_t >= 1.0:
+                continue
+            pm = self._inhale_pixmaps[idx]
+            angle_offset = (idx - (n - 1) / 2.0) * 14.0
+            self._paint_single_inhale(p, mc, pm, local_t, angle_offset)
 
-        # Soft mouth-cavity clipping during the final swallow stage so image vanishes INSIDE mouth
+    def _paint_single_inhale(
+        self, p: QPainter, mc: QPointF, pm: QPixmap, prog: float, angle_offset_deg: float
+    ) -> None:
+        p.save()
         if prog > 0.56:
             clip_blend = min(1.0, (prog - 0.56) / 0.24)
             rx, ry = self._mouth_radii()
-            # Interpolate from generous oval down to exact mouth cavity oval
             cur_rx = rx * (2.6 - 1.56 * clip_blend)
             cur_ry = ry * (2.6 - 1.56 * clip_blend)
             clip_path = QPainterPath()
             clip_path.addEllipse(mc, cur_rx, cur_ry)
             p.setClipPath(clip_path)
 
-        # Spiral trajectory: starts in front-right of Kirby's mouth and swirls tightly to mouth center
         start_radius = 102.0
         radius = start_radius * (1.0 - (prog ** 1.32))
-        # Clockwise spiral angle stays cleanly clear of Kirby's eyes and inside canvas
-        orbit_angle = math.radians(16.0) + (prog ** 1.38) * math.radians(330.0)
+        orbit_angle = math.radians(16.0 + angle_offset_deg) + (prog ** 1.38) * math.radians(330.0)
         ix = mc.x() + math.cos(orbit_angle) * radius
         iy = mc.y() + math.sin(orbit_angle) * radius * 0.68
 
-        # Image self-rotation (spins faster and faster as it gets sucked in!)
         spin_deg = -(prog ** 1.55) * 900.0
-
-        # Smooth shrinking down to tiny point inside throat
         scale = max(0.04, 1.0 - _ease_in_cubic(prog) * 0.96)
         opacity = 1.0 if prog < 0.80 else max(0.0, 1.0 - (prog - 0.80) / 0.20)
 
@@ -1055,7 +1074,6 @@ class KirbyMascotWindow(QWidget):
         p.rotate(spin_deg)
         p.scale(scale, scale)
 
-        # Cute subtle white sticker border around incoming image so it pops against desktop
         bw, bh = pm.width(), pm.height()
         frame = QRectF(-bw / 2.0, -bh / 2.0, bw, bh)
         p.setPen(QPen(QColor(255, 255, 255, 210), 3.0))
@@ -1063,55 +1081,66 @@ class KirbyMascotWindow(QWidget):
         p.drawRoundedRect(frame.adjusted(-4, -4, 4, 4), 10, 10)
         p.drawPixmap(frame, pm, QRectF(pm.rect()))
 
-        # Subtle mouth-depth shadow as it enters the dark throat
         if prog > 0.65:
             dark_alpha = int(150 * ((prog - 0.65) / 0.35))
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QColor(115, 16, 46, dark_alpha))
             p.drawRoundedRect(frame.adjusted(-4, -4, 4, 4), 10, 10)
-
         p.restore()
 
-    def _paint_popout_cutout(self, p: QPainter, prog: float) -> None:
-        """Emits the background-removed cutout in a playful arc from behind Kirby's back."""
-        pm = self._popout_pixmap
-        if pm is None:
+    def _paint_popout_cutouts(self, p: QPainter, prog: float) -> None:
+        """Emits one or a playful fan of cutouts from behind Kirby's back."""
+        n = len(self._popout_pixmaps)
+        if n == 0:
             return
 
-        # Cubic Bezier arc starting hidden behind Kirby's back -> curving out upper-left -> landing left of back
-        p0 = QPointF(KIRBY_X + KIRBY_SIZE * 0.42, KIRBY_Y + KIRBY_SIZE * 0.44)
-        p1 = QPointF(KIRBY_X + KIRBY_SIZE * 0.12, KIRBY_Y + KIRBY_SIZE * 0.02)
-        p2 = QPointF(KIRBY_X - 52.0, KIRBY_Y - 10.0)
-        p3 = QPointF(KIRBY_X - 76.0, KIRBY_Y + KIRBY_SIZE * 0.44)
+        for idx in range(n - 1, -1, -1):
+            pm = self._popout_pixmaps[idx]
+            spread = (idx - (n - 1) / 2.0) if n > 1 else 0.0
+            stagger = idx * 0.05
+            local_prog = max(0.0, min(1.0, (prog - stagger) / max(0.5, 1.0 - stagger)))
+            if local_prog <= 0.0:
+                continue
 
-        t = _ease_out_cubic(prog)
-        u = 1.0 - t
-        bx = (u**3) * p0.x() + 3 * (u**2) * t * p1.x() + 3 * u * (t**2) * p2.x() + (t**3) * p3.x()
-        by = (u**3) * p0.y() + 3 * (u**2) * t * p1.y() + 3 * u * (t**2) * p2.y() + (t**3) * p3.y()
+            p0 = QPointF(KIRBY_X + KIRBY_SIZE * 0.42, KIRBY_Y + KIRBY_SIZE * 0.44)
+            p1 = QPointF(KIRBY_X + KIRBY_SIZE * 0.12, KIRBY_Y + KIRBY_SIZE * 0.02 + spread * 10.0)
+            p2 = QPointF(KIRBY_X - 52.0 - abs(spread) * 6.0, KIRBY_Y - 10.0 + spread * 22.0)
+            p3 = QPointF(KIRBY_X - 76.0 + spread * 14.0, KIRBY_Y + KIRBY_SIZE * 0.44 + spread * 22.0)
 
-        scale = 0.16 + 0.84 * min(1.12, _ease_out_back(min(1.0, prog * 1.05)))
-        rot_deg = -32.0 * (1.0 - t) + math.sin(prog * math.pi * 2.0) * 6.0 * (1.0 - prog)
-        opacity = min(1.0, prog / 0.18)
+            t = _ease_out_cubic(local_prog)
+            u = 1.0 - t
+            bx = (u**3) * p0.x() + 3 * (u**2) * t * p1.x() + 3 * u * (t**2) * p2.x() + (t**3) * p3.x()
+            by = (u**3) * p0.y() + 3 * (u**2) * t * p1.y() + 3 * u * (t**2) * p2.y() + (t**3) * p3.y()
 
-        p.save()
-        p.setOpacity(opacity)
-        p.translate(bx, by)
-        p.rotate(rot_deg)
-        p.scale(scale, scale)
+            scale = 0.16 + 0.84 * min(1.12, _ease_out_back(min(1.0, local_prog * 1.05)))
+            rot_deg = -32.0 * (1.0 - t) + spread * 8.0 * t
+            opacity = min(1.0, local_prog / 0.18)
 
-        # Glowing starlight halo behind the freshly cut-out transparent PNG!
-        halo_r = max(pm.width(), pm.height()) * 0.62
-        grad = QRadialGradient(0, 0, halo_r)
-        grad.setColorAt(0.0, QColor(255, 232, 145, 165))
-        grad.setColorAt(0.55, QColor(255, 152, 208, 95))
-        grad.setColorAt(1.0, QColor(255, 152, 208, 0))
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(grad))
-        p.drawEllipse(QPointF(0, 0), halo_r, halo_r)
+            p.save()
+            p.setOpacity(opacity)
+            p.translate(bx, by)
+            p.rotate(rot_deg)
+            p.scale(scale, scale)
 
-        rect = QRectF(-pm.width() / 2.0, -pm.height() / 2.0, pm.width(), pm.height())
-        p.drawPixmap(rect, pm, QRectF(pm.rect()))
-        p.restore()
+            if idx == 0:
+                halo_r = max(pm.width(), pm.height()) * 0.65
+                grad = QRadialGradient(0, 0, halo_r)
+                grad.setColorAt(0.0, QColor(255, 232, 145, 165))
+                grad.setColorAt(0.55, QColor(255, 152, 208, 95))
+                grad.setColorAt(1.0, QColor(255, 152, 208, 0))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QBrush(grad))
+                p.drawEllipse(QPointF(0, 0), halo_r, halo_r)
+
+            rect = QRectF(-pm.width() / 2.0, -pm.height() / 2.0, pm.width(), pm.height())
+            p.drawPixmap(rect, pm, QRectF(pm.rect()))
+            p.restore()
+
+        # Cute count badge when popping out multiple images
+        if self._batch_count > 1 and prog > 0.35:
+            badge_x = KIRBY_X - 76.0
+            badge_y = KIRBY_Y + KIRBY_SIZE * 0.44 - 58.0
+            self._paint_bottom_pill(p, badge_x, badge_y, f"✨ ×{self._batch_count}")
 
     def _paint_digest_orbit(self, p: QPainter, center: QPointF) -> None:
         colors = [QColor("#FFD659"), QColor("#FF85C0"), QColor("#8CE5FF"), QColor("#FFFFFF")]
@@ -1208,20 +1237,21 @@ class KirbyMascotWindow(QWidget):
     def leaveEvent(self, _event) -> None:
         self._toolbar_hide_timer.start(520)
 
-    # --- Drag & Drop Image Files Directly into Kirby's Mouth ---
-    def _extract_image_path(self, mime) -> Optional[str]:
+    # --- Drag & Drop Single or Multiple Image Files ---
+    def _extract_image_paths(self, mime) -> List[str]:
         if mime is None or not mime.hasUrls():
-            return None
+            return []
+        paths: List[str] = []
         for url in mime.urls():
             if url.isLocalFile():
                 p = Path(url.toLocalFile())
                 if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS:
-                    return str(p)
-        return None
+                    paths.append(str(p))
+        return paths
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         mime = event.mimeData()
-        if self._extract_image_path(mime) is not None or (mime is not None and mime.hasImage()):
+        if self._extract_image_paths(mime) or (mime is not None and mime.hasImage()):
             event.acceptProposedAction()
             if self._state == self.STATE_IDLE:
                 self._state = self.STATE_DRAG_HOVER
@@ -1232,7 +1262,7 @@ class KirbyMascotWindow(QWidget):
 
     def dragMoveEvent(self, event: QDragMoveEvent) -> None:
         mime = event.mimeData()
-        if self._extract_image_path(mime) is not None or (mime is not None and mime.hasImage()):
+        if self._extract_image_paths(mime) or (mime is not None and mime.hasImage()):
             event.acceptProposedAction()
         else:
             event.ignore()
@@ -1245,10 +1275,10 @@ class KirbyMascotWindow(QWidget):
 
     def dropEvent(self, event: QDropEvent) -> None:
         mime = event.mimeData()
-        path = self._extract_image_path(mime)
-        if path is not None:
+        paths = self._extract_image_paths(mime)
+        if paths:
             event.acceptProposedAction()
-            self.eat_file(path)
+            self.eat_files(paths)
             return
         if mime is not None and mime.hasImage():
             qimg = mime.imageData()

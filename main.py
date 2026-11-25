@@ -6,6 +6,7 @@ import ctypes
 import sys
 from pathlib import Path
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication
@@ -30,18 +31,19 @@ def main() -> int:
     app.setApplicationName("星之卡比去背精靈")
     app.setQuitOnLastWindowClosed(False)
 
-    # Single-instance check: if already running, wake existing Kirby (and pass file if any)
+    cli_files = [str(Path(a)) for a in sys.argv[1:] if Path(a).is_file()]
+
+    # Single-instance check: wake existing Kirby and forward one or multiple dropped files
     probe = QLocalSocket()
     probe.connectToServer(SINGLE_INSTANCE_KEY)
     if probe.waitForConnected(250):
-        payload = f"EAT:{sys.argv[1]}" if len(sys.argv) > 1 else "SHOW"
+        payload = ("EAT:" + "\n".join(cli_files)) if cli_files else "SHOW"
         probe.write(payload.encode("utf-8"))
         probe.flush()
         probe.waitForBytesWritten(250)
         probe.disconnectFromServer()
         return 0
 
-    # Clear stale socket if previous run crashed
     QLocalServer.removeServer(SINGLE_INSTANCE_KEY)
     server = QLocalServer(app)
     server.listen(SINGLE_INSTANCE_KEY)
@@ -64,19 +66,14 @@ def main() -> int:
             sock.deleteLater()
         kirby.bring_to_front()
         if msg.startswith("EAT:"):
-            p = Path(msg[4:])
-            if p.is_file():
-                kirby.eat_file(str(p))
+            paths = [line.strip() for line in msg[4:].splitlines() if line.strip() and Path(line.strip()).is_file()]
+            if paths:
+                kirby.eat_files(paths)
 
     server.newConnection.connect(_on_new_instance)
 
-    # Support dropping a file directly onto the desktop shortcut icon!
-    if len(sys.argv) > 1:
-        arg_path = Path(sys.argv[1])
-        if arg_path.is_file():
-            from PySide6.QtCore import QTimer
-
-            QTimer.singleShot(350, lambda: kirby.eat_file(str(arg_path)))
+    if cli_files:
+        QTimer.singleShot(350, lambda: kirby.eat_files(cli_files))
 
     return app.exec()
 

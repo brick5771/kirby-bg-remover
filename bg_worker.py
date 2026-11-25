@@ -1,11 +1,11 @@
-"""Background removal & B&W conversion worker powered by local rembg ONNX models."""
+"""Background removal & B&W conversion worker supporting single and multi-image batches."""
 
 from __future__ import annotations
 
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image, ImageOps
 from PySide6.QtCore import QObject, QThread, Signal
@@ -119,13 +119,78 @@ def start_prewarm_daemon(cache: SessionCache, model_key: str = "fast") -> thread
     return t
 
 
-class RemoveBgThread(QThread):
-    """Runs rembg background removal and/or B&W conversion off the UI thread."""
+class BatchProcessThread(QThread):
+    """Processes one or multiple images (rembg and/or B&W) off the UI thread."""
 
     status_changed = Signal(str)
-    finished_ok = Signal(object, float, str, str)  # (PIL.Image RGBA, elapsed_s, model_key, stem)
+    finished_ok = Signal(object, float, str)  # (List[(PIL.Image RGBA, stem)], elapsed_s, model_key)
     finished_err = Signal(str)
 
+    def __init__(
+        self,
+        cache: SessionCache,
+        source_items: List[Tuple[Image.Image, str]],
+        model_key: str,
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._cache = cache
+        self._source_items = source_items
+        self._model_key = model_key
+
+    def run(self) -> None:
+        try:
+            opt = MODEL_OPTIONS.get(self._model_key, MODEL_OPTIONS["fast"])
+            total = len(self._source_items)
+            if total == 0:
+                raise RuntimeError("沒有可處理的圖片")
+
+            sess = None
+            remove_fn = None
+            if opt.rembg_name is not None:
+                from rembg import remove
+
+                remove_fn = remove
+                if not self._cache.is_loaded(self._model_key):
+                    self.status_changed.emit(f"載入 {opt.short_label} 模型中...")
+                sess = self._cache.get_session(self._model_key)
+
+            t0 = time.perf_counter()
+            outputs: List[Tuple[Image.Image, str]] = []
+
+            for idx, (src_img, stem) in enumerate(self._source_items, start=1):
+                suffix = f" ({idx}/{total})" if total > 1 else ""
+                if opt.rembg_name is None:
+                    self.status_changed.emit(f"卡比把圖片轉成黑白中{suffix}...")
+                elif opt.grayscale:
+                    self.status_changed.emit(f"卡比去背並轉黑白中{suffix}...")
+                else:
+                    self.status_changed.emit(f"卡比努力消化去背中{suffix}...")
+
+                img = ImageOps.exif_transpose(src_img)
+                if img.mode not in ("RGB", "RGBA"):
+                    img = img.convert("RGBA")
+
+                if remove_fn is None:
+                    out_rgba = convert_to_bw_rgba(img)
+                else:
+                    result = remove_fn(img, session=sess)
+                    if not isinstance(result, Image.Image):
+                        raise RuntimeError("去背回傳格式異常")
+                    out_rgba = result.convert("RGBA")
+                    if opt.grayscale:
+                        out_rgba = convert_to_bw_rgba(out_rgba)
+
+                outputs.append((out_rgba, stem or f"kirby_{idx}"))
+
+            elapsed = time.perf_counter() - t0
+            self.finished_ok.emit(outputs, elapsed, self._model_key)
+        except Exception as exc:
+            self.finished_err.emit(f"處理失敗：{exc}")
+
+
+# Backwards-compatible alias for single-image callers
+class RemoveBgThread(BatchProcessThread):
     def __init__(
         self,
         cache: SessionCache,
@@ -134,45 +199,4 @@ class RemoveBgThread(QThread):
         source_stem: str,
         parent: Optional[QObject] = None,
     ) -> None:
-        super().__init__(parent)
-        self._cache = cache
-        self._source_image = source_image
-        self._model_key = model_key
-        self._source_stem = source_stem
-
-    def run(self) -> None:
-        try:
-            opt = MODEL_OPTIONS.get(self._model_key, MODEL_OPTIONS["fast"])
-            img = ImageOps.exif_transpose(self._source_image)
-            if img.mode not in ("RGB", "RGBA"):
-                img = img.convert("RGBA")
-
-            if opt.rembg_name is None:
-                # Pure color -> B&W conversion (keep background)
-                self.status_changed.emit("卡比把圖片轉成黑白中...")
-                t0 = time.perf_counter()
-                result_rgba = convert_to_bw_rgba(img)
-                elapsed = time.perf_counter() - t0
-                self.finished_ok.emit(result_rgba, elapsed, self._model_key, self._source_stem)
-                return
-
-            from rembg import remove
-
-            if not self._cache.is_loaded(self._model_key):
-                self.status_changed.emit(f"載入 {opt.short_label} 模型中...")
-            sess = self._cache.get_session(self._model_key)
-
-            self.status_changed.emit(
-                "卡比去背並轉黑白中..." if opt.grayscale else "卡比努力消化去背中..."
-            )
-            t0 = time.perf_counter()
-            result = remove(img, session=sess)
-            if not isinstance(result, Image.Image):
-                raise RuntimeError("去背回傳格式異常")
-            result_rgba = result.convert("RGBA")
-            if opt.grayscale:
-                result_rgba = convert_to_bw_rgba(result_rgba)
-            elapsed = time.perf_counter() - t0
-            self.finished_ok.emit(result_rgba, elapsed, self._model_key, self._source_stem)
-        except Exception as exc:
-            self.finished_err.emit(f"處理失敗：{exc}")
+        super().__init__(cache, [(source_image, source_stem)], model_key, parent=parent)
