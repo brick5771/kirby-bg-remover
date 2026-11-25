@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from bg_worker import MODEL_OPTIONS, MODEL_ORDER
+from bg_worker import MODEL_OPTIONS, MODEL_ORDER, convert_to_bw_rgba
 from clipboard_win import (
     IMAGE_EXTENSIONS,
     copy_transparent_png_to_clipboard,
@@ -116,9 +116,11 @@ class ResultCardWindow(QWidget):
     def __init__(self, sound: SoundManager, parent=None) -> None:
         super().__init__(parent)
         self._sound = sound
+        self._base_pil: Optional[Image.Image] = None
         self._result_pil: Optional[Image.Image] = None
         self._source_stem = "kirby_cutout"
         self._model_key = "fast"
+        self._bw_toggled = False
         desktop_dir = QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DesktopLocation)
         self._last_save_dir = desktop_dir or str(Path.home() / "Desktop")
         self._drag_offset: Optional[QPoint] = None
@@ -191,13 +193,9 @@ class ResultCardWindow(QWidget):
         self._preview = PreviewCanvas(self._card)
         layout.addWidget(self._preview)
 
-        # --- Background preview switcher + dimensions ---
+        # --- Background preview switcher + instant B&W toggle + dimensions ---
         subbar = QHBoxLayout()
-        subbar.setSpacing(5)
-
-        bg_lbl = QLabel("預覽底色：")
-        bg_lbl.setObjectName("SubText")
-        subbar.addWidget(bg_lbl)
+        subbar.setSpacing(4)
 
         self._bg_btns: dict[str, QPushButton] = {}
         for mode, text in (("checker", "透明格"), ("light", "淺白"), ("dark", "深黑")):
@@ -209,6 +207,14 @@ class ResultCardWindow(QWidget):
             subbar.addWidget(btn)
             self._bg_btns[mode] = btn
         self._bg_btns["checker"].setChecked(True)
+
+        self._bw_btn = QPushButton("🖤 轉黑白")
+        self._bw_btn.setObjectName("BwToggle")
+        self._bw_btn.setCheckable(True)
+        self._bw_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._bw_btn.setToolTip("一鍵切換彩色／黑白輸出（儲存與複製會套用目前效果）")
+        self._bw_btn.clicked.connect(self._toggle_bw_filter)
+        subbar.addWidget(self._bw_btn)
 
         subbar.addStretch(1)
         self._dim_lbl = QLabel("")
@@ -324,6 +330,25 @@ class ResultCardWindow(QWidget):
                 border-color: #D94388;
                 font-weight: 700;
             }
+            QPushButton#BwToggle {
+                background-color: #F2EFF5;
+                color: #4A3E52;
+                border: 1px solid #D8CEE0;
+                border-radius: 9px;
+                padding: 2px 8px;
+                font-family: "Microsoft JhengHei UI", "Segoe UI";
+                font-size: 11px;
+                font-weight: 600;
+            }
+            QPushButton#BwToggle:hover {
+                background-color: #E7E0EE;
+            }
+            QPushButton#BwToggle:checked {
+                background-color: #2D2A36;
+                color: #FFFFFF;
+                border-color: #1A1822;
+                font-weight: 700;
+            }
             QLabel#ToastLbl {
                 color: #1F7A4D;
                 background-color: #E3F9ED;
@@ -410,12 +435,19 @@ class ResultCardWindow(QWidget):
         source_stem: str,
         kirby_rect: QRect,
     ) -> None:
+        self._base_pil = pil_img
         self._result_pil = pil_img
         self._source_stem = source_stem or "kirby_cutout"
         self.set_model_key(model_key)
 
+        opt = MODEL_OPTIONS.get(model_key, MODEL_OPTIONS["fast"])
+        self._bw_toggled = False
+        self._bw_btn.setVisible(not opt.grayscale)
+        self._bw_btn.setChecked(False)
+        self._refresh_labels_for_mode()
+
         self._preview.set_image(pil_img)
-        self._meta_lbl.setText(f"{elapsed_s:.1f}s")
+        self._meta_lbl.setText(f"{elapsed_s:.1f}s" if elapsed_s >= 0.1 else "<0.1s")
         self._dim_lbl.setText(f"{pil_img.width} × {pil_img.height}")
         self._toast_lbl.setVisible(False)
         self.adjustSize()
@@ -440,6 +472,29 @@ class ResultCardWindow(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def _refresh_labels_for_mode(self) -> None:
+        opt = MODEL_OPTIONS.get(self._model_key, MODEL_OPTIONS["fast"])
+        if self._model_key == "bw":
+            self._title_lbl.setText("🖤 黑白轉換完成！")
+            self._save_btn.setText("💾 儲存黑白圖")
+        elif opt.grayscale or self._bw_toggled:
+            self._title_lbl.setText("🌗 去背＋黑白完成！")
+            self._save_btn.setText("💾 儲存黑白去背圖")
+        else:
+            self._title_lbl.setText("✨ 去背完成！")
+            self._save_btn.setText("💾 儲存去背圖")
+
+    def _toggle_bw_filter(self) -> None:
+        if self._base_pil is None:
+            return
+        self._sound.play("click")
+        self._bw_toggled = self._bw_btn.isChecked()
+        self._result_pil = (
+            convert_to_bw_rgba(self._base_pil) if self._bw_toggled else self._base_pil
+        )
+        self._preview.set_image(self._result_pil)
+        self._refresh_labels_for_mode()
 
     def _select_bg(self, mode: str) -> None:
         self._sound.play("click")
@@ -472,6 +527,8 @@ class ResultCardWindow(QWidget):
             """
         )
         for key in MODEL_ORDER:
+            if key == "bw":
+                menu.addSeparator()
             opt = MODEL_OPTIONS[key]
             act = QAction(opt.menu_label, menu)
             act.setCheckable(True)
@@ -493,16 +550,26 @@ class ResultCardWindow(QWidget):
         if self._result_pil is None:
             return
         self._sound.play("click")
-        default_name = f"{self._source_stem}_nobg.png"
+        opt = MODEL_OPTIONS.get(self._model_key, MODEL_OPTIONS["fast"])
+        if self._model_key == "bw":
+            suffix = "_bw"
+            dlg_title = "儲存星之卡比黑白圖"
+        elif opt.grayscale or self._bw_toggled:
+            suffix = "_nobg_bw"
+            dlg_title = "儲存星之卡比黑白去背圖"
+        else:
+            suffix = "_nobg"
+            dlg_title = "儲存星之卡比去背圖"
+        default_name = f"{self._source_stem}{suffix}.png"
         default_path = str(Path(self._last_save_dir) / default_name)
 
         # Temporarily lower always-on-top so native Save dialog never hides behind card
         was_top = self._always_on_top
         path, _ = QFileDialog.getSaveFileName(
             self,
-            "儲存星之卡比去背圖",
+            dlg_title,
             default_path,
-            "PNG 透明圖片 (*.png)",
+            "PNG 圖片 (*.png)",
         )
         if was_top:
             self.raise_()

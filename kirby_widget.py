@@ -257,7 +257,7 @@ class KirbyMascotWindow(QWidget):
         self._model_btn = QPushButton("⚡ 快速 ▾")
         self._model_btn.setObjectName("TopModelBtn")
         self._model_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._model_btn.setToolTip("選擇去背模型（預設最快）")
+        self._model_btn.setToolTip("選擇去背或黑白轉換模式（預設快速去背）")
         self._model_btn.clicked.connect(self._open_model_menu)
         row.addWidget(self._model_btn)
 
@@ -569,7 +569,7 @@ class KirbyMascotWindow(QWidget):
         self._result_card.hide()
         self._state = self.STATE_DIGESTING
         self._state_t = 0.0
-        self._status_text = f"切換 {MODEL_OPTIONS[model_key].short_label} 重新去背中..."
+        self._status_text = f"切換 {MODEL_OPTIONS[model_key].short_label} 重新處理中..."
         self._sound.play("gulp")
         self._start_worker(self._current_source_pil, model_key, self._current_source_stem)
         self.update()
@@ -648,6 +648,8 @@ class KirbyMascotWindow(QWidget):
             """
         )
         for key in MODEL_ORDER:
+            if key == "bw":
+                menu.addSeparator()
             opt = MODEL_OPTIONS[key]
             act = QAction(opt.menu_label, menu)
             act.setCheckable(True)
@@ -715,9 +717,11 @@ class KirbyMascotWindow(QWidget):
         menu.addAction(act_paste)
 
         menu.addSeparator()
-        model_sub = menu.addMenu("🎛️ 切換去背模型")
+        model_sub = menu.addMenu("🎛️ 切換去背／黑白模式")
         model_sub.setStyleSheet(menu.styleSheet())
         for key in MODEL_ORDER:
+            if key == "bw":
+                model_sub.addSeparator()
             opt = MODEL_OPTIONS[key]
             act = QAction(opt.menu_label, model_sub)
             act.setCheckable(True)
@@ -947,9 +951,16 @@ class KirbyMascotWindow(QWidget):
         # 8) Contextual status / hover hint pill below Kirby
         pill_text = ""
         if self._state == self.STATE_DRAG_HOVER:
-            pill_text = "放開餵進卡比嘴巴去背！"
+            if self._model_key == "bw":
+                pill_text = "放開餵進卡比嘴巴轉黑白！"
+            elif self._model_key == "fast_bw":
+                pill_text = "放開餵進嘴巴去背＋轉黑白！"
+            else:
+                pill_text = "放開餵進卡比嘴巴去背！"
         elif self._state == self.STATE_DIGESTING:
-            pill_text = self._status_text or "卡比消化去背中..."
+            pill_text = self._status_text or (
+                "卡比轉黑白中..." if self._model_key == "bw" else "卡比消化去背中..."
+            )
         elif self._status_text:
             pill_text = self._status_text
         elif self._state == self.STATE_IDLE and self._hovering:
