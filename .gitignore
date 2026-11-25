@@ -12,6 +12,7 @@ desktop.ini
 .vscode/
 .idea/
 
-# Temporary / zip exports
+# Temporary / zip exports / machine-specific shortcuts
 *.zip
 *.log
+*.lnk
