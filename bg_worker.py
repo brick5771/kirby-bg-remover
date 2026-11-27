@@ -47,8 +47,8 @@ MODEL_OPTIONS: Dict[str, ModelOption] = {
         key="bw",
         rembg_name=None,
         short_label="🖤 純黑白",
-        menu_label="🖤 純轉黑白（不去背・瞬間完成）",
-        description="將彩色圖片轉為高質感黑白灰階（保留原背景）",
+        menu_label="🖤 純轉黑白（不去背・輸出小容量 JPEG）",
+        description="將彩色圖片轉為高質感黑白灰階並輸出小容量 JPEG（保留原背景）",
         grayscale=True,
     ),
     "fast_bw": ModelOption(

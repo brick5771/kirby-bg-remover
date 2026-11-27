@@ -120,13 +120,68 @@ def copy_transparent_png_to_clipboard(pil_img: Image.Image) -> bool:
     return True
 
 
-def copy_multiple_pngs_to_clipboard(items: List[Tuple[Image.Image, str]]) -> List[Path]:
-    """Save all processed PNGs into a clean temp batch folder and place all file URLs (CF_HDROP)
-    onto the Windows clipboard so Ctrl+V pastes ALL images at once into Explorer, Desktop, Line,
-    Discord, PowerPoint, etc.
+def save_image_file(
+    pil_img: Image.Image,
+    target: Path | str,
+    fmt: str = "PNG",
+    grayscale: bool = False,
+    jpeg_quality: int = 88,
+) -> None:
+    """Save a PIL image as PNG (RGBA) or compact JPEG (white-composited L/RGB)."""
+    fmt_upper = fmt.upper()
+    if fmt_upper in ("JPEG", "JPG"):
+        rgba = pil_img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        bg.paste(rgba, mask=rgba.getchannel("A"))
+        out = ImageOps.grayscale(bg) if grayscale else bg
+        out.save(target, format="JPEG", quality=jpeg_quality, optimize=True)
+    else:
+        pil_img.convert("RGBA").save(target, format="PNG")
+
+
+def copy_single_jpeg_to_clipboard(
+    pil_img: Image.Image,
+    filename_stem: str = "kirby_bw",
+    grayscale: bool = True,
+) -> Path:
+    """Save a single compact JPEG into the temp batch folder and copy both the file URL
+    (so Explorer / Line / Discord paste the small .jpg file) and bitmap image data."""
+    root = _clipboard_batch_root()
+    batch_dir = root / f"single_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    base = (filename_stem or "kirby_bw").strip()
+    for ext in (".jpg", ".jpeg", ".png"):
+        if base.lower().endswith(ext):
+            base = base[: -len(ext)]
+            break
+    safe = "".join("_" if c in '<>:"/\\|?*' else c for c in base).strip(" .") or "kirby_bw"
+    out_path = batch_dir / f"{safe}.jpg"
+    save_image_file(pil_img, out_path, fmt="JPEG", grayscale=grayscale)
+
+    mime = QMimeData()
+    mime.setUrls([QUrl.fromLocalFile(str(out_path))])
+    mime.setImageData(pil_to_qimage(pil_img))
+    QGuiApplication.clipboard().setMimeData(mime)
+
+    _prune_old_batches(root, keep=3)
+    return out_path
+
+
+def copy_multiple_pngs_to_clipboard(
+    items: List[Tuple[Image.Image, str]],
+    fmt: str = "PNG",
+    grayscale: bool = False,
+) -> List[Path]:
+    """Save all processed images (PNG or JPEG) into a clean temp batch folder and place all
+    file URLs (CF_HDROP) onto the Windows clipboard so Ctrl+V pastes ALL images at once into
+    Explorer, Desktop, Line, Discord, PowerPoint, etc.
     """
     if not items:
         return []
+
+    use_jpeg = fmt.upper() in ("JPEG", "JPG")
+    ext = ".jpg" if use_jpeg else ".png"
 
     root = _clipboard_batch_root()
     batch_dir = root / f"batch_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
@@ -137,19 +192,21 @@ def copy_multiple_pngs_to_clipboard(items: List[Tuple[Image.Image, str]]) -> Lis
 
     for idx, (pil_img, raw_name) in enumerate(items, start=1):
         base = (raw_name or f"kirby_{idx}").strip()
-        if base.lower().endswith(".png"):
-            base = base[:-4]
+        for old_ext in (".png", ".jpg", ".jpeg"):
+            if base.lower().endswith(old_ext):
+                base = base[: -len(old_ext)]
+                break
         # Sanitize Windows forbidden filename characters
         safe = "".join("_" if c in '<>:"/\\|?*' else c for c in base).strip(" .") or f"kirby_{idx}"
-        candidate = f"{safe}.png"
+        candidate = f"{safe}{ext}"
         n = 2
         while candidate.lower() in used_names:
-            candidate = f"{safe}_{n}.png"
+            candidate = f"{safe}_{n}{ext}"
             n += 1
         used_names.add(candidate.lower())
 
         out_path = batch_dir / candidate
-        pil_img.convert("RGBA").save(out_path, format="PNG")
+        save_image_file(pil_img, out_path, fmt="JPEG" if use_jpeg else "PNG", grayscale=grayscale)
         saved_paths.append(out_path)
 
     mime = QMimeData()

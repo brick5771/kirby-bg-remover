@@ -39,9 +39,11 @@ from bg_worker import MODEL_OPTIONS, MODEL_ORDER, convert_to_bw_rgba
 from clipboard_win import (
     IMAGE_EXTENSIONS,
     copy_multiple_pngs_to_clipboard,
+    copy_single_jpeg_to_clipboard,
     copy_transparent_png_to_clipboard,
     pil_to_qimage,
     read_images_from_clipboard,
+    save_image_file,
 )
 from sound_fx import SoundManager
 
@@ -670,6 +672,14 @@ class ResultCardWindow(QWidget):
             return "_nobg_bw"
         return "_nobg"
 
+    def _prefers_jpeg(self) -> bool:
+        """Pure B&W (without background removal) defaults to compact JPEG."""
+        return self._model_key == "bw"
+
+    def _is_grayscale_output(self) -> bool:
+        opt = MODEL_OPTIONS.get(self._model_key, MODEL_OPTIONS["fast"])
+        return opt.grayscale or self._bw_toggled
+
     def _refresh_labels_for_mode(self) -> None:
         opt = MODEL_OPTIONS.get(self._model_key, MODEL_OPTIONS["fast"])
         count = len(self._display_items)
@@ -677,7 +687,7 @@ class ResultCardWindow(QWidget):
 
         if self._model_key == "bw":
             self._title_lbl.setText(f"🖤 黑白完成{batch_tag}！")
-            single_save = "💾 儲存黑白圖"
+            single_save = "💾 儲存黑白 JPEG"
         elif opt.grayscale or self._bw_toggled:
             self._title_lbl.setText(f"🌗 去背黑白{batch_tag}！")
             single_save = "💾 儲存黑白去背圖"
@@ -686,7 +696,8 @@ class ResultCardWindow(QWidget):
             single_save = "💾 儲存去背圖"
 
         if count > 1:
-            self._save_btn.setText(f"💾 全部儲存 ({count}張)")
+            fmt_tag = " JPEG" if self._prefers_jpeg() else ""
+            self._save_btn.setText(f"💾 全部儲存{fmt_tag} ({count}張)")
             self._copy_btn.setText(f"📋 複製全部 ({count}張)")
         else:
             self._save_btn.setText(single_save)
@@ -769,19 +780,37 @@ class ResultCardWindow(QWidget):
         self._sound.play("click")
         pil_img, stem = self._display_items[self._current_index]
         suffix = self._output_suffix()
-        dlg_title = "儲存星之卡比黑白圖" if suffix == "_bw" else "儲存星之卡比去背圖"
-        default_path = str(Path(self._last_save_dir) / f"{stem}{suffix}.png")
+        prefer_jpg = self._prefers_jpeg()
+        default_ext = ".jpg" if prefer_jpg else ".png"
+        dlg_title = "儲存星之卡比黑白圖 (JPEG)" if prefer_jpg else "儲存星之卡比去背圖"
+        default_path = str(Path(self._last_save_dir) / f"{stem}{suffix}{default_ext}")
+        file_filter = (
+            "JPEG 圖片 (*.jpg *.jpeg);;PNG 圖片 (*.png)"
+            if prefer_jpg
+            else "PNG 圖片 (*.png);;JPEG 圖片 (*.jpg *.jpeg)"
+        )
 
         was_top = self._always_on_top
-        path, _ = QFileDialog.getSaveFileName(self, dlg_title, default_path, "PNG 圖片 (*.png)")
+        path, selected_filter = QFileDialog.getSaveFileName(self, dlg_title, default_path, file_filter)
         if was_top:
             self.raise_()
         if not path:
             return
-        if not path.lower().endswith(".png"):
-            path += ".png"
+
+        lower = path.lower()
+        if lower.endswith((".jpg", ".jpeg")):
+            save_fmt = "JPEG"
+        elif lower.endswith(".png"):
+            save_fmt = "PNG"
+        elif "JPEG" in (selected_filter or "").upper():
+            path += ".jpg"
+            save_fmt = "JPEG"
+        else:
+            path += default_ext
+            save_fmt = "JPEG" if prefer_jpg else "PNG"
+
         try:
-            pil_img.save(path, format="PNG")
+            save_image_file(pil_img, path, fmt=save_fmt, grayscale=self._is_grayscale_output())
             self._last_save_dir = str(Path(path).parent)
             self._sound.play("save")
             self._show_toast(f"✓ 已儲存：{Path(path).name}")
@@ -802,20 +831,25 @@ class ResultCardWindow(QWidget):
             return
         dest = Path(folder)
         suffix = self._output_suffix()
+        prefer_jpg = self._prefers_jpeg()
+        ext = ".jpg" if prefer_jpg else ".png"
+        save_fmt = "JPEG" if prefer_jpg else "PNG"
+        is_gray = self._is_grayscale_output()
         saved_count = 0
         try:
             for idx, (pil_img, stem) in enumerate(self._display_items, start=1):
                 safe = "".join("_" if c in '<>:"/\\|?*' else c for c in (stem or f"kirby_{idx}")).strip(" .")
-                target = dest / f"{safe}{suffix}.png"
+                target = dest / f"{safe}{suffix}{ext}"
                 n = 2
                 while target.exists():
-                    target = dest / f"{safe}{suffix}_{n}.png"
+                    target = dest / f"{safe}{suffix}_{n}{ext}"
                     n += 1
-                pil_img.save(target, format="PNG")
+                save_image_file(pil_img, target, fmt=save_fmt, grayscale=is_gray)
                 saved_count += 1
             self._last_save_dir = str(dest)
             self._sound.play("save")
-            self._show_toast(f"✓ 已全部儲存 {saved_count} 張至「{dest.name}」！")
+            fmt_label = " JPEG" if prefer_jpg else ""
+            self._show_toast(f"✓ 已全部儲存 {saved_count} 張{fmt_label} 至「{dest.name}」！")
         except Exception as exc:
             self._show_toast(f"批次儲存失敗：{exc}", error=True)
 
@@ -824,19 +858,35 @@ class ResultCardWindow(QWidget):
             return
         if self._is_batch:
             suffix = self._output_suffix()
+            prefer_jpg = self._prefers_jpeg()
             named = [(img, f"{stem}{suffix}") for img, stem in self._display_items]
-            paths = copy_multiple_pngs_to_clipboard(named)
+            paths = copy_multiple_pngs_to_clipboard(
+                named,
+                fmt="JPEG" if prefer_jpg else "PNG",
+                grayscale=self._is_grayscale_output(),
+            )
             self._sound.play("save")
-            self._show_toast(f"✓ 已一次複製全部 {len(paths)} 張圖片！直接 Ctrl+V 即可貼出")
+            fmt_label = " JPEG" if prefer_jpg else ""
+            self._show_toast(f"✓ 已一次複製全部 {len(paths)} 張{fmt_label} 圖片！直接 Ctrl+V 即可貼出")
         else:
             self.copy_current_only()
 
     def copy_current_only(self) -> None:
         if self._result_pil is None:
             return
-        copy_transparent_png_to_clipboard(self._result_pil)
-        self._sound.play("save")
-        self._show_toast("✓ 已複製目前這張透明 PNG！可直接 Ctrl+V 貼上")
+        if self._prefers_jpeg():
+            _, stem = self._display_items[self._current_index]
+            copy_single_jpeg_to_clipboard(
+                self._result_pil,
+                filename_stem=f"{stem}{self._output_suffix()}",
+                grayscale=True,
+            )
+            self._sound.play("save")
+            self._show_toast("✓ 已複製目前這張黑白 JPEG！可直接 Ctrl+V 貼上")
+        else:
+            copy_transparent_png_to_clipboard(self._result_pil)
+            self._sound.play("save")
+            self._show_toast("✓ 已複製目前這張透明 PNG！可直接 Ctrl+V 貼上")
 
     def _on_pick_new(self) -> None:
         self._sound.play("click")
